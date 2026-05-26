@@ -1,24 +1,32 @@
 """
-Scraper — Arquivo Pessoa (arquivopessoa.net)
+Scraper - Arquivo Pessoa (arquivopessoa.net)
 ============================================
-Estratégia: força bruta sobre IDs numéricos (ID_MIN..ID_MAX).
-Cada página é aceite se:
-  1. Tiver <div class="autor"> com um dos 3 heterónimos
-  2. Tiver <div class="texto-poesia"> (é um poema, não prosa)
-  3. O rodapé bibliográfico referenciar uma obra poética aceite
+Strategy: brute force over numeric IDs (ID_MIN..ID_MAX).
 
-Produz:
-  output/caeiro.txt
-  output/campos.txt
-  output/reis.txt
-  output/corpus_sem_token.txt
-  output/corpus_com_token.txt
-  output/metadata.json
+Filters (all optional, combined with AND logic):
+  --authors     List of author keys to accept (e.g. CAEIRO CAMPOS)
+  --works       List of work terms to accept (e.g. "Mensagem" "Odes")
+  --type        Text type: "verso", "prosa", or "ambos" (default: verso)
+  --language    List of language codes to accept (e.g. pt en fr)
 
-Uso:
-  pip install requests beautifulsoup4
-  python3 scraper.py
-  python3 scraper.py --inicio 1400 --fim 1600
+Examples:
+  # Original behaviour — 3 heteronyms, verse only, Portuguese only
+  python3 scraper.py --authors CAEIRO CAMPOS REIS --type verso --language pt
+
+  # All authors, verse only, Portuguese only
+  python3 scraper.py --type verso --language pt
+
+  # Campos in English and Portuguese
+  python3 scraper.py --authors CAMPOS --language pt en
+
+  # Everything, no filters
+  python3 scraper.py --type ambos
+
+  # Test on a small range
+  python3 scraper.py --start 1440 --end 1510 --authors CAEIRO --language pt
+
+Dependencies:
+  pip install requests beautifulsoup4 lingua-language-detector
 """
 
 import re
@@ -29,7 +37,32 @@ import argparse
 import requests
 from bs4 import BeautifulSoup
 
-# Configuração 
+# Language Detection
+
+try:
+    from lingua import Language, LanguageDetectorBuilder
+
+    _SUPPORTED_LANGUAGES = [
+        Language.PORTUGUESE,
+        Language.ENGLISH,
+        Language.FRENCH,
+        Language.SPANISH,
+        Language.LATIN,
+    ]
+    _DETECTOR = LanguageDetectorBuilder.from_languages(*_SUPPORTED_LANGUAGES).build()
+    _LANGUAGE_TO_CODE = {
+        Language.PORTUGUESE: "pt",
+        Language.ENGLISH:    "en",
+        Language.FRENCH:     "fr",
+        Language.SPANISH:    "es",
+        Language.LATIN:      "la",
+    }
+    LANGUAGE_AVAILABLE = True
+except ImportError:
+    LANGUAGE_AVAILABLE = False
+
+
+# Configuration
 BASE_URL    = "http://arquivopessoa.net"
 HEADERS     = {
     "User-Agent": (
@@ -39,48 +72,23 @@ HEADERS     = {
     )
 }
 ID_MIN      = 1
-ID_MAX      = 5000
-DELAY       = 0.1
-DELAY_RETRY = 1.0
-OUTPUT_DIR  = "output"
+ID_MAX      = 4600
+DELAY       = 0.5
+DELAY_RETRY = 0.5
+OUTPUT_DIR  = "data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Autores
-AUTORES = {
+# Known authors
+KNOWN_AUTHORS = {
     "Alberto Caeiro":   "CAEIRO",
     "Álvaro de Campos": "CAMPOS",
     "Ricardo Reis":     "REIS",
-}
-
-TOKEN_MAP = {
-    "CAEIRO": "<CAEIRO>",
-    "CAMPOS": "<CAMPOS>",
-    "REIS":   "<REIS>",
-}
-
-OBRAS_ACEITES = {
-    "CAEIRO": [
-        "Guardador de Rebanhos",
-        "Pastor Amoroso",
-        "Poemas Inconjuntos",
-        "Poemas de Alberto Caeiro",
-        "Fragmentos",
-    ],
-    "CAMPOS": [
-        "Poesias de Álvaro de Campos",
-        "Poemas de Álvaro de Campos",
-        "Livro de Versos",
-    ],
-    "REIS": [
-        "Odes de Ricardo Reis",
-        "Poemas de Ricardo Reis",
-        "Odes",
-    ],
+    "Fernando Pessoa":  "PESSOA",
 }
 
 # HTTP
 def fetch(url: str):
-    for tentativa in range(3):
+    for attempt in range(3):
         try:
             r = requests.get(url, headers=HEADERS, timeout=15)
             if r.status_code in (404, 403):
@@ -89,174 +97,259 @@ def fetch(url: str):
             r.encoding = "utf-8"
             return BeautifulSoup(r.text, "html.parser")
         except requests.exceptions.Timeout:
-            print(f"    [timeout] tentativa {tentativa + 1}")
+            print(f"    [timeout] attempt {attempt + 1}")
             time.sleep(DELAY_RETRY)
         except Exception as e:
-            print(f"    [erro] {e} — tentativa {tentativa + 1}")
+            print(f"    [error] {e} — attempt {attempt + 1}")
             time.sleep(DELAY_RETRY)
     return None
 
-# Extracção
-def identificar_autor(soup):
-    """Lê <div class='autor'> e devolve chave do autor ou None."""
+
+# Language detection
+def detect_language(text: str) -> str | None:
+    """
+    Returns the ISO code of the detected language ('pt', 'en', 'fr', 'es', 'la').
+    Returns None if the library is unavailable or detection fails.
+    """
+    if not LANGUAGE_AVAILABLE:
+        return None
+    language = _DETECTOR.detect_language_of(text)
+    if language is None:
+        return None
+    return _LANGUAGE_TO_CODE.get(language)
+
+def language_accepted(text: str, language_filter: set) -> bool:
+    """
+    Returns True if the text is in the desired language.
+    In case of doubt (failed detection), always accepts.
+    """
+    language = detect_language(text)
+    if language is None:
+        return True   # doubt → accept
+    return language in language_filter
+
+
+# Extraction
+def identify_author(soup):
     div = soup.find("div", class_="autor")
     if not div:
-        return None
-    nome = div.get_text(strip=True)
-    return AUTORES.get(nome)
+        return None, None
+    name = div.get_text(strip=True)
+    key = KNOWN_AUTHORS.get(name, name.upper().replace(" ", "_"))
+    return name, key
 
-
-def obra_aceite(soup, chave):
-    """Verifica referência bibliográfica no texto completo da página."""
-    texto = soup.get_text(" ", strip=True)
-    return any(t.lower() in texto.lower() for t in OBRAS_ACEITES[chave])
-
-
-def extrair_titulo(soup):
-    """Lê <h1 class='titulo-texto'>."""
+def extract_title(soup):
     h1 = soup.find("h1", class_="titulo-texto")
     return h1.get_text(strip=True) if h1 else ""
 
-
-def extrair_corpo(soup):
-    """
-    Lê <div class='texto-poesia'>.
-    Cada <p> é um verso; <p> vazio é separador de estrofe.
-    Devolve texto com estrofes separadas por linha em branco.
-    """
+def extract_verse_body(soup):
     div = soup.find("div", class_="texto-poesia")
     if not div:
         return ""
+    lines = [p.get_text(strip=True) for p in div.find_all("p")]
+    body = "\n".join(lines)
+    body = re.sub(r"\n{2,}", "\n\n", body)
+    body = re.sub(r"^\s*[IVXLCDM]+\s*\n+", "", body)
+    return body.strip()
 
-    paragrafos = div.find_all("p")
-    linhas = []
-    for p in paragrafos:
-        texto = p.get_text(strip=True)
-        linhas.append(texto)   # string vazia para <p> vazio = linha em branco
+def extract_prose_body(soup):
+    div = soup.find("div", class_="texto-prosa")
+    if not div:
+        return ""
+    body = div.get_text("\n", strip=True)
+    body = re.sub(r"\n{2,}", "\n\n", body)
+    return body.strip()
 
-    # Colapsa mais de 1 linha em branco consecutiva para exactamente 1
-    corpo = "\n".join(linhas)
-    corpo = re.sub(r"\n{2,}", "\n\n", corpo)
+def detect_type(soup):
+    if soup.find("div", class_="texto-poesia"):
+        return "verso"
+    if soup.find("div", class_="texto-prosa"):
+        return "prosa"
+    return None
 
-    # Remove o numeral romano isolado que o site repete no início
-    # (ex: "I\n\nEu nunca guardei..." → "Eu nunca guardei...")
-    corpo = re.sub(r"^\s*[IVXLCDM]+\s*\n+", "", corpo)
+def work_referenced(soup, works_filter):
+    text = soup.get_text(" ", strip=True)
+    return any(w.lower() in text.lower() for w in works_filter)
 
-    return corpo.strip()
 
-# Formatação
-def formatar_bloco(poema, com_token):
-    partes = []
-    if com_token:
-        partes.append(TOKEN_MAP[poema["autor"]])
-    partes.append(poema["titulo"])
-    partes.append("")
-    partes.append(poema["corpo"])
-    return "\n".join(partes)
+# Formatting and writing
+def format_block(poem, token_map):
+    parts = []
+    token = token_map.get(poem["autor"]) if token_map else None
+    if token:
+        parts.append(token)
+    parts.append(poem["titulo"])
+    parts.append("")
+    parts.append(poem["corpo"])
+    return "\n".join(parts)
 
-# Escrita
-
-def escrever_corpus(caminho, blocos):
-    with open(caminho, "w", encoding="utf-8") as f:
-        f.write("\n\n---\n\n".join(blocos))
+def write_corpus(path, blocks):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n\n---\n\n".join(blocks))
         f.write("\n")
-    kb = os.path.getsize(caminho) / 1024
-    print(f"  -> {caminho}  ({kb:.1f} KB, {len(blocos)} poemas)")
+    kb = os.path.getsize(path) / 1024
+    print(f"  -> {path}  ({kb:.1f} KB, {len(blocks)} texts)")
+
 
 # Main
+def main(args):
+    author_filter   = {a.upper() for a in args.authors} if args.authors else None
+    works_filter    = args.works if args.works else None
+    type_filter     = args.type
+    language_filter = set(args.language) if args.language else None
 
-def main(id_inicio, id_fim):
-    poemas = []
-    ignoradas = 0
+    if language_filter and not LANGUAGE_AVAILABLE:
+        print("WARNING: --language was specified but 'lingua-language-detector' is not installed.")
+        print("         Install with: pip install lingua-language-detector")
+        print("         Ignoring language filter.\n")
+        language_filter = None
 
-    print(f"Scraping IDs {id_inicio}..{id_fim}")
+    token_map = {}
+    poems     = []
+    ignored   = 0
+
+    print(f"Scraping IDs {args.start}..{args.end}")
+    if author_filter:
+        print(f"  Author filter   : {', '.join(sorted(author_filter))}")
+    if works_filter:
+        print(f"  Works filter    : {', '.join(works_filter)}")
+    print(f"  Type filter     : {type_filter}")
+    if language_filter:
+        print(f"  Language filter : {', '.join(sorted(language_filter))}")
     print("=" * 60)
 
-    for id_pagina in range(id_inicio, id_fim + 1):
-        url  = f"{BASE_URL}/textos/{id_pagina}"
+    for page_id in range(args.start, args.end + 1):
+        url  = f"{BASE_URL}/textos/{page_id}"
         soup = fetch(url)
         if soup is None:
             continue
 
-        # 1. Autor
-        chave = identificar_autor(soup)
-        if chave is None:
-            ignoradas += 1
+        # Filter 1: Author
+        author_name, key = identify_author(soup)
+        if key is None:
+            ignored += 1
             continue
 
-        # 2. Tem div.texto-poesia? (filtra prosa e páginas de índice)
-        if not soup.find("div", class_="texto-poesia"):
-            print(f"  [{id_pagina}] {chave} — sem texto-poesia, a ignorar")
-            ignoradas += 1
+        if author_filter and key not in author_filter:
+            ignored += 1
             time.sleep(DELAY)
             continue
 
-        # 3. Obra aceite?
-        if not obra_aceite(soup, chave):
-            print(f"  [{id_pagina}] {chave} — obra não aceite, a ignorar")
-            ignoradas += 1
+        if key not in token_map:
+            token_map[key] = f"<{key}>"
+
+        # Filter 2: Type
+        text_type = detect_type(soup)
+        if text_type is None:
+            ignored += 1
+            continue
+
+        if type_filter == "verso" and text_type != "verso":
+            ignored += 1
             time.sleep(DELAY)
             continue
 
-        # 4. Extrair
-        titulo = extrair_titulo(soup)
-        corpo  = extrair_corpo(soup)
-
-        if not corpo:
-            print(f"  [{id_pagina}] {chave} — corpo vazio, a ignorar")
-            ignoradas += 1
+        if type_filter == "prosa" and text_type != "prosa":
+            ignored += 1
             time.sleep(DELAY)
             continue
 
-        poema = {
-            "id":       id_pagina,
-            "autor":    chave,
-            "titulo":   titulo,
-            "corpo":    corpo,
-            "url":      url,
-            "n_chars":  len(corpo),
-            "n_linhas": len(corpo.splitlines()),
+        # Filter 3: Work
+        if works_filter and not work_referenced(soup, works_filter):
+            print(f"  [{page_id}] {key} — work not accepted, skipping")
+            ignored += 1
+            time.sleep(DELAY)
+            continue
+
+        # Extraction
+        title = extract_title(soup)
+        body  = extract_verse_body(soup) if text_type == "verso" else extract_prose_body(soup)
+
+        if not body:
+            print(f"  [{page_id}] {key} — empty body, skipping")
+            ignored += 1
+            time.sleep(DELAY)
+            continue
+
+        # Filter 4: Language
+        if language_filter and not language_accepted(body, language_filter):
+            print(f"  [{page_id}] {key} — language not accepted ({detect_language(body)}), skipping")
+            ignored += 1
+            time.sleep(DELAY)
+            continue
+
+        detected_language = detect_language(body) if LANGUAGE_AVAILABLE else None
+
+        poem = {
+            "id":         page_id,
+            "autor":      key,
+            "nome_autor": author_name,
+            "tipo":       text_type,
+            "lingua":     detected_language,
+            "titulo":     title,
+            "corpo":      body,
+            "url":        url,
+            "n_chars":    len(body),
+            "n_linhas":   len(body.splitlines()),
         }
-        poemas.append(poema)
-        print(f"  [{id_pagina}] {chave} — {titulo[:55]}")
+        poems.append(poem)
+        language_label = f" [{detected_language}]" if detected_language else ""
+        print(f"  [{page_id}] {key}{language_label} — {title[:50]}")
 
         time.sleep(DELAY)
 
-    # Ficheiros individuais
+    # Individual files per author
     print("\n" + "=" * 60)
-    print("A escrever ficheiros...")
+    print("Writing files...")
 
-    for chave in ("CAEIRO", "CAMPOS", "REIS"):
-        subset = [p for p in poemas if p["autor"] == chave]
-        if not subset:
-            continue
-        blocos = [formatar_bloco(p, com_token=False) for p in subset]
-        escrever_corpus(os.path.join(OUTPUT_DIR, f"{chave.lower()}.txt"), blocos)
+    found_authors = sorted({p["autor"] for p in poems})
 
-    blocos_sem = [formatar_bloco(p, com_token=False) for p in poemas]
-    escrever_corpus(os.path.join(OUTPUT_DIR, "corpus_sem_token.txt"), blocos_sem)
+    for key in found_authors:
+        subset = [p for p in poems if p["autor"] == key]
+        blocks = [format_block(p, {}) for p in subset]
+        write_corpus(os.path.join(OUTPUT_DIR, f"{key.lower()}.txt"), blocks)
 
-    blocos_com = [formatar_bloco(p, com_token=True) for p in poemas]
-    escrever_corpus(os.path.join(OUTPUT_DIR, "corpus_com_token.txt"), blocos_com)
+    blocks_without = [format_block(p, {}) for p in poems]
+    write_corpus(os.path.join(OUTPUT_DIR, "corpus_sem_token.txt"), blocks_without)
+
+    blocks_with = [format_block(p, token_map) for p in poems]
+    write_corpus(os.path.join(OUTPUT_DIR, "corpus_com_token.txt"), blocks_with)
 
     with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w", encoding="utf-8") as f:
-        json.dump(poemas, f, ensure_ascii=False, indent=2)
+        json.dump(poems, f, ensure_ascii=False, indent=2)
 
-    # Resumo
+    # Summary
     print("\n" + "=" * 60)
-    print("RESUMO")
+    print("SUMMARY")
     print("=" * 60)
-    for chave in ("CAEIRO", "CAMPOS", "REIS"):
-        subset = [p for p in poemas if p["autor"] == chave]
+    for key in found_authors:
+        subset = [p for p in poems if p["autor"] == key]
         chars  = sum(p["n_chars"] for p in subset)
-        print(f"  {chave:8s}: {len(subset):4d} poemas   {chars/1024:6.1f} KB")
-    total = sum(p["n_chars"] for p in poemas)
-    print(f"  {'TOTAL':8s}: {len(poemas):4d} poemas   {total/1024:6.1f} KB")
-    print(f"  Ignoradas: {ignoradas}")
+        print(f"  {key:12s}: {len(subset):4d} texts   {chars/1024:6.1f} KB")
+    total = sum(p["n_chars"] for p in poems)
+    print(f"  {'TOTAL':12s}: {len(poems):4d} texts   {total/1024:6.1f} KB")
+    print(f"  Ignored: {ignored}")
 
+# CLI
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--inicio", type=int, default=ID_MIN)
-    parser.add_argument("--fim",    type=int, default=ID_MAX)
+    parser = argparse.ArgumentParser(
+        description="Arquivo Pessoa scraper",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--start",    type=int, default=ID_MIN,
+                        help=f"Start ID (default: {ID_MIN})")
+    parser.add_argument("--end",      type=int, default=ID_MAX,
+                        help=f"End ID (default: {ID_MAX})")
+    parser.add_argument("--authors",  nargs="+", default=None,
+                        help="Author keys to accept (e.g. CAEIRO CAMPOS REIS PESSOA).")
+    parser.add_argument("--works",    nargs="+", default=None,
+                        help='Work terms to accept (e.g. "Mensagem" "Odes").')
+    parser.add_argument("--type",     default="verso",
+                        choices=["verso", "prosa", "ambos"],
+                        help="Text type to accept (default: verso)")
+    parser.add_argument("--language", nargs="+", default=None,
+                        metavar="CODE",
+                        help="ISO language codes to accept (e.g. pt en fr). "
+                             "Requires: pip install lingua-language-detector")
     args = parser.parse_args()
-    main(args.inicio, args.fim)
+    main(args)
